@@ -51,7 +51,8 @@ SRC = \
   gsupplicant_error.c \
   gsupplicant_interface.c \
   gsupplicant_network.c \
-  gsupplicant_util.c
+  gsupplicant_util.c \
+  mcs_index_rates.c
 GEN_SRC = \
   fi.w1.wpa_supplicant1.c \
   fi.w1.wpa_supplicant1.Interface.c \
