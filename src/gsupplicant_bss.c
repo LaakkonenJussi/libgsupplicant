@@ -853,181 +853,639 @@ static void handle_legacy(GSupplicantBSS* self, const guint *values, gsize n)
     }
 }
 
+#include <stdint.h>
+#include <glib.h>
+
 typedef struct {
-    gboolean ht;
-    gboolean vht;
-    gboolean he;
+    gboolean ht;           /* 802.11n support */
+    gboolean vht;          /* 802.11ac support */
+    gboolean he;           /* 802.11ax support */
 
-    guint8 nss;
-    guint8 mcs_index;   /* ADD THIS */
+    guint8 nss;            /* Number of spatial streams (1-8) */
+    guint8 mcs_index;      /* Maximum MCS index */
+                           /* HT: 0-31 (NSS * 8 + MCS within NSS) */
+                           /* VHT: 0-9 per NSS */
+                           /* HE: 0-11 per NSS */
 
-    guint width;        /* 20 / 40 / 80 / 160 */
-    gboolean short_gi;  /* ADD THIS (needed for aircrack) */
+    guint width;           /* Channel width: 20/40/80/160 MHz */
+    gboolean short_gi;     /* Short Guard Interval support */
+} gsupplicant_wifi_capability_t;
 
-} GSupplicantWifiCapability;
+/* HT Capabilities IE (802.11n) - IE type 45 */
+typedef struct {
+    uint16_t capabilities;      /* Offset 0-1 */
+    uint8_t ampdu_params;       /* Offset 2 */
+    uint8_t mcs_set[16];        /* Offset 3-18: MCS 0-127 support */
+    uint16_t ht_extended_cap;   /* Offset 19-20 */
+    uint32_t tx_beamform_cap;   /* Offset 21-24 */
+    uint8_t asel_cap;           /* Offset 25 */
+} ht_cap_t;
 
-static guint8
-ht_get_max_nss(const guint8 *mcs_set)
+/* HT Operation IE (802.11n) - IE type 61 */
+typedef struct {
+    uint8_t primary_channel;    /* Offset 0 */
+    uint8_t ht_param;           /* Offset 1: bit 2 = secondary channel offset */
+    uint16_t ht_operation_1;    /* Offset 2-3 */
+    uint16_t ht_operation_2;    /* Offset 4-5 */
+    uint16_t ht_operation_3;    /* Offset 6-7 */
+    uint8_t mcs_set[16];        /* Offset 8-23: Basic MCS Set */
+} ht_oper_t;
+
+/* VHT Capabilities IE (802.11ac) - IE type 191 */
+typedef struct {
+    uint32_t vht_capabilities;  /* Offset 0-3: capability bits */
+    uint16_t mcs_nss_set;       /* Offset 4-11: MCS set per NSS (RX) */
+    uint16_t rx_mcs_map;        /* RX MCS map */
+    uint16_t rx_highest_rate;   /* RX highest rate */
+    uint16_t tx_mcs_map;        /* TX MCS map */
+    uint16_t tx_highest_rate;   /* TX highest rate */
+} vht_cap_t;
+
+/* VHT Operation IE (802.11ac) - IE type 192 */
+typedef struct {
+    uint8_t channel_width;      /* Offset 0: 0=20/40, 1=80, 2=160, 3=80+80 */
+    uint8_t channel_cf1;        /* Offset 1: Center frequency segment 1 */
+    uint8_t channel_cf2;        /* Offset 2: Center frequency segment 2 */
+    uint16_t mcs_nss_set;       /* Offset 3-4: Basic MCS-NSS set */
+} vht_oper_t;
+
+/* HE Capabilities IE (802.11ax) - IE type 255, extension 35 */
+typedef struct {
+    uint8_t mac_cap[6];         /* Offset 0-5: MAC capabilities */
+    uint8_t phy_cap[11];        /* Offset 6-16: PHY capabilities */
+    /* MCS-NSS set follows: variable length depending on bandwidth support */
+} he_cap_t;
+
+/* HE Operation IE (802.11ax) - IE type 255, extension 36 */
+typedef struct {
+    uint8_t oper_param[3];      /* Offset 0-2: VHT operation info + HE operation info */
+    uint16_t mcs_nss_set;       /* Offset 3-4: Basic MCS-NSS set */
+} he_oper_t;
+
+/**
+ * Extract Short GI support from HT Capabilities
+ *
+ * HT Capabilities (IE 45):
+ * - Byte 0-1: HT Capabilities Info
+ *   - Bit 5: Short GI for 20 MHz
+ *   - Bit 6: Short GI for 40 MHz
+ *
+ * Returns TRUE if Short GI is supported for the current width
+ */
+static gboolean
+ht_parse_short_gi(const uint8_t *ie, gsize len, guint channel_width)
 {
+    const ht_cap_t *ht_cap;
+
+    if (len < sizeof(ht_cap_t))
+        return FALSE;
+
+    ht_cap = (const ht_cap_t *)ie;
+    uint16_t cap_info =
+        (uint16_t)ie[0] |
+        ((uint16_t)ie[1] << 8);
+
+    if (channel_width == 20) {
+        return (cap_info & 0x20) ? TRUE : FALSE;  /* Bit 5 */
+    } else if (channel_width == 40) {
+        return (cap_info & 0x40) ? TRUE : FALSE;  /* Bit 6 */
+    }
+
+    return FALSE;
+}
+
+/**
+ * Extract maximum MCS index from HT Capabilities
+ *
+ * The MCS Set field (Offset 3-18) contains 16 bytes:
+ * - Bytes 0-3: Supported MCS for spatial stream 1-4
+ * - Byte 12 (bit 0-1): RX highest data rate
+ *
+ * Returns the highest MCS index (0-31), or -1 on error
+ */
+static gint
+ht_parse_max_mcs(const uint8_t *ie, gsize len, guint8 *out_nss)
+{
+    const ht_cap_t *ht_cap;
     guint8 nss = 0;
+    gint max_mcs_idx = -1;
 
-    for (int stream = 0; stream < 8; stream++) {
-        guint8 has_rate = 0;
+    if (len < sizeof(ht_cap_t))
+        return -1;
 
-        for (int i = 0; i < 8; i++) {
-            if (mcs_set[stream] & (1 << i)) {
-                has_rate = 1;
+    ht_cap = (const ht_cap_t *)ie;
+
+    /* Parse MCS set to find highest supported MCS per spatial stream */
+    for (int stream = 0; stream < 4; stream++) {
+        guint8 mcs_byte = ht_cap->mcs_set[stream];
+
+        if (mcs_byte == 0)
+            continue;
+
+        nss = stream + 1;
+
+        /* Find highest bit set in this MCS byte */
+        for (int i = 7; i >= 0; i--) {
+            if (mcs_byte & (1 << i)) {
+                gint this_mcs = (stream * 8) + i;
+                if (this_mcs > max_mcs_idx) {
+                    max_mcs_idx = this_mcs;
+                }
                 break;
             }
         }
-
-        if (has_rate)
-            nss = stream + 1;
     }
 
-    return nss;
+    *out_nss = nss;
+    return max_mcs_idx;
 }
 
+/**
+ * Parse HT Capabilities IE (type 45)
+ *
+ * Fixed length: 26 bytes
+ */
 static void
-parse_ht_cap(const guint8 *ie, gsize len,
-             GSupplicantWifiCapability *cap)
+parse_ht_capabilities(const uint8_t *ie, gsize len,
+                      gsupplicant_wifi_capability_t *cap)
 {
-    if (len < 12)
+    guint8 nss = 0;
+    gint mcs_idx;
+
+    if (len < 26) {
+        GVERBOSE_("HT Capabilities IE too short: %zu bytes", len);
         return;
+    }
 
     cap->ht = TRUE;
 
-    const guint8 *mcs = &ie[3];
+    /* Extract maximum MCS index */
+    mcs_idx = ht_parse_max_mcs(ie, len, &nss);
+    if (mcs_idx >= 0) {
+        cap->nss = nss;
+        cap->mcs_index = (guint8)mcs_idx;
+        GVERBOSE_("HT: NSS=%u, MCS=%u", nss, cap->mcs_index);
+    } else {
+        cap->nss = 1;
+        cap->mcs_index = 7;  /* Fallback to MCS7 (safest) */
+        GVERBOSE_("HT: Could not parse MCS, using fallback MCS7");
+    }
 
-    cap->nss = ht_get_max_nss(mcs);
-
-    /* HT has no real "mcs_index", assume max */
-    cap->mcs_index = 7;
+    /* Short GI will be determined after width is known */
 }
 
-static void parse_ht_oper(const guint8 *ie, gsize len,
-                          GSupplicantWifiCapability *cap)
-{
-    if (len < 3)
-        return;
-
-    guint8 param = ie[1];
-    cap->width = (param & 0x04) ? 40 : 20;
-}
-
+/**
+ * Parse HT Operation IE (type 61)
+ *
+ * Variable length, minimum 5 bytes for 20 MHz, typically 22 bytes with MCS set
+ *
+ * Channel width info:
+ * - Offset 1, Bit 2: Secondary Channel Offset
+ *   - 0 = No secondary channel
+ *   - 1 = Secondary channel above primary
+ *   - 3 = Secondary channel below primary
+ */
 static void
-parse_vht_cap(const guint8 *ie, gsize len,
-              GSupplicantWifiCapability *cap)
+parse_ht_operation(const uint8_t *ie, gsize len,
+                   gsupplicant_wifi_capability_t *cap)
 {
-    if (len < 12)
+    const ht_oper_t *ht_oper;
+
+    if (len < 5) {
+        GVERBOSE_("HT Operation IE too short: %zu bytes", len);
         return;
+    }
+
+    ht_oper = (const ht_oper_t *)ie;
+    uint8_t ht_param = ht_oper->ht_param;
+
+    /* Bit 2: Secondary Channel Offset */
+    uint8_t sec_channel = (ht_param >> 2) & 0x03;
+
+    if (sec_channel == 0) {
+        cap->width = 20;
+    } else {
+        cap->width = 40;
+    }
+
+    GVERBOSE_("HT Operation: width=%u MHz", cap->width);
+}
+
+/**
+ * Extract Short GI support from VHT Capabilities
+ *
+ * VHT Capabilities (IE 191):
+ * - Byte 0-3: VHT Capability Info
+ *   - Bit 5: Short GI for 80 MHz
+ *   - Bit 6: Short GI for 160 and 80+80 MHz
+ *
+ * Returns TRUE if Short GI is supported for the current width
+ */
+static gboolean
+vht_parse_short_gi(const uint8_t *ie, gsize len, guint channel_width)
+{
+    const vht_cap_t *vht_cap;
+
+    if (len < 4)
+        return FALSE;
+
+    vht_cap = (const vht_cap_t *)ie;
+    uint32_t cap_info = vht_cap->vht_capabilities;
+
+    if (channel_width == 80) {
+        return (cap_info & 0x20) ? TRUE : FALSE;  /* Bit 5 */
+    } else if (channel_width == 160) {
+        return (cap_info & 0x40) ? TRUE : FALSE;  /* Bit 6 */
+    }
+
+    return FALSE;
+}
+
+/**
+ * Parse VHT MCS-NSS Set
+ *
+ * Each 2-byte MCS-NSS Set contains 8 entries (2 bits each) for MCS 0-7:
+ * - 0 = MCS 0-7 supported
+ * - 1 = MCS 0-8 supported
+ * - 2 = MCS 0-9 supported
+ * - 3 = Not supported
+ *
+ * Iterates through all spatial streams to find maximum MCS supported
+ */
+static guint8
+vht_parse_max_mcs(const uint8_t *ie, gsize len, guint8 *out_nss)
+{
+    const vht_cap_t *vht_cap;
+    guint8 max_mcs = 0;
+    guint8 nss = 0;
+
+    if (len < 12)
+        return 0;
+
+    vht_cap = (const vht_cap_t *)ie;
+
+    /* Parse RX MCS map (2 bytes) to find maximum MCS per NSS */
+    uint16_t mcs_map = vht_cap->rx_mcs_map | (vht_cap->rx_highest_rate & 0x03) << 14;
+
+    for (int ss = 0; ss < 8; ss++) {
+        uint8_t mcs_support = (mcs_map >> (ss * 2)) & 0x03;
+
+        if (mcs_support == 3)  /* Not supported */
+            continue;
+
+        nss = ss + 1;
+
+        /* Convert MCS support level to actual MCS index */
+        switch (mcs_support) {
+        case 0:
+            max_mcs = 7;
+            break;
+        case 1:
+            max_mcs = 8;
+            break;
+        case 2:
+            max_mcs = 9;
+            break;
+        }
+    }
+
+    *out_nss = nss;
+    return max_mcs;
+}
+
+/**
+ * Parse VHT Capabilities IE (type 191)
+ *
+ * Fixed length: 12 bytes
+ */
+static void
+parse_vht_capabilities(const uint8_t *ie, gsize len,
+                       gsupplicant_wifi_capability_t *cap)
+{
+    guint8 nss = 0;
+
+    if (len < 12) {
+        GVERBOSE_("VHT Capabilities IE too short: %zu bytes", len);
+        return;
+    }
 
     cap->vht = TRUE;
 
-    const guint16 *mcs_map = (const guint16 *)&ie[4];
-
-    guint8 nss = 1;
-
-    for (int i = 0; i < 8; i++) {
-        guint16 v = mcs_map[i];
-
-        if (v != 0xFFFF)
-            nss = i + 1;
-    }
-
+    /* Extract maximum MCS index */
+    cap->mcs_index = vht_parse_max_mcs(ie, len, &nss);
     cap->nss = nss;
-    cap->mcs_index = 9; /* fallback: VHT MCS 0-9 assumed max */
+
+    GVERBOSE_("VHT: NSS=%u, MCS=%u", nss, cap->mcs_index);
+
+    /* Short GI will be determined after width is known */
 }
 
-static void parse_vht_oper(const guint8 *ie, gsize len,
-                           GSupplicantWifiCapability *cap)
-{
-    if (len < 3)
-        return;
-
-    switch (ie[0]) {
-        case 0: cap->width = 40; break;
-        case 1: cap->width = 80; break;
-        case 2: cap->width = 160; break;
-        default: cap->width = 80; break;
-    }
-}
-
+/**
+ * Parse VHT Operation IE (type 192)
+ *
+ * Fixed length: 5 bytes
+ *
+ * Channel width:
+ * - Offset 0: Channel Width field
+ *   - 0 = 20 or 40 MHz (use HT operation for distinction)
+ *   - 1 = 80 MHz
+ *   - 2 = 160 MHz
+ *   - 3 = 80+80 MHz (not fully supported here)
+ */
 static void
-parse_he_cap(const guint8 *ie, gsize len,
-             GSupplicantWifiCapability *cap)
+parse_vht_operation(const uint8_t *ie, gsize len,
+                    gsupplicant_wifi_capability_t *cap)
 {
-    if (len < 20)
+    const vht_oper_t *vht_oper;
+
+    if (len < 5) {
+        GVERBOSE_("VHT Operation IE too short: %zu bytes", len);
         return;
+    }
+
+    vht_oper = (const vht_oper_t *)ie;
+    uint8_t channel_width = vht_oper->channel_width;
+
+    switch (channel_width) {
+    case 0:
+        /* Fall back to HT operation for 20/40 MHz determination */
+        if (cap->width == 0)
+            cap->width = 80;  /* VHT default if HT not parsed */
+        break;
+    case 1:
+        cap->width = 80;
+        break;
+    case 2:
+        cap->width = 160;
+        break;
+    case 3:
+        /* 80+80 MHz - report as 160 for rate calculation */
+        cap->width = 160;
+        GVERBOSE_("VHT: 80+80 MHz detected (reported as 160)");
+        break;
+    default:
+        GVERBOSE_("VHT: Invalid channel width %u", channel_width);
+        break;
+    }
+
+    GVERBOSE_("VHT Operation: width=%u MHz", cap->width);
+}
+
+/**
+ * Parse HE Capabilities IE (802.11ax - IE type 255, extension 35)
+ *
+ * Variable length, minimum 21 bytes (MAC cap 6 + PHY cap 11 + minimal MCS-NSS)
+ *
+ * PHY Capabilities (offset 6-16, 11 bytes):
+ * - Byte 8, Bit 1: Short GI for 80 MHz
+ * - Byte 8, Bit 2: Short GI for 160 MHz
+ *
+ * MCS-NSS Set (offset 17+):
+ * - Varies by bandwidth support in PHY capabilities
+ * - Minimum: 4 bytes (80 MHz only)
+ * - Maximum: 12 bytes (20/40/80/160 MHz)
+ */
+static void
+parse_he_capabilities(const uint8_t *ie, gsize len,
+                      gsupplicant_wifi_capability_t *cap)
+{
+    const he_cap_t *he_cap;
+    guint8 best_mcs = 0;
+    guint8 best_nss = 1;
+
+    if (len < 21) {
+        GVERBOSE_("HE Capabilities IE too short: %zu bytes", len);
+        return;
+    }
 
     cap->he = TRUE;
+    he_cap = (const he_cap_t *)ie;
 
-    /*
-     * HE MCS map is 4 bytes per SS (HE PHY spec)
-     * We extract BEST NSS + BEST MCS (simplified)
-     */
+    /* Parse HE-MCS-NSS set - first set is for 80 MHz (mandatory) */
+    /* MCS-NSS set structure: 2 bytes per NSS, 8 NSS entries = 16 bytes minimum */
+    if (len >= 37) {
+        /* Parse 80 MHz MCS-NSS set (mandatory, at offset 17) */
+        const uint8_t *mcs_set = &ie[17];
 
-    guint8 best_nss = 1;
-    guint8 best_mcs = 0;
+        for (int ss = 0; ss < 8; ss++) {
+            /* 2-bit MCS index per NSS */
+            uint8_t mcs_idx = (mcs_set[ss >> 2] >> ((ss & 3) * 2)) & 0x03;
 
-    const guint8 *mcs = &ie[8]; // HE-MCS map start (simplified offset)
+            if (mcs_idx == 3)  /* Not supported */
+                continue;
 
-    for (int ss = 0; ss < 8; ss++) {
-        guint8 v = mcs[ss];
-
-        if (v == 0xff)
-            continue;
-
-        if (v > best_mcs) {
-            best_mcs = v;
             best_nss = ss + 1;
+
+            /* Map 802.11ax MCS levels (0-2) to MCS indices (0-11) */
+            /* HE supports MCS 0-11 (vs VHT's 0-9) */
+            switch (mcs_idx) {
+            case 0:
+                best_mcs = 7;
+                break;
+            case 1:
+                best_mcs = 10;
+                break;
+            case 2:
+                best_mcs = 11;
+                break;
+            }
         }
     }
 
     cap->nss = best_nss;
-    cap->mcs_index = best_mcs & 0x7;
+    cap->mcs_index = best_mcs;
+
+    GVERBOSE_("HE: NSS=%u, MCS=%u", best_nss, best_mcs);
+
+    /* HE operation will determine width, default to 80 MHz */
+    if (cap->width == 0)
+        cap->width = 80;
 }
 
-/*static guint compute_rate_aircrack(const GSupplicantWifiCapability *cap)
+/**
+ * Parse HE Operation IE (802.11ax - IE type 255, extension 36)
+ *
+ * Variable length, minimum 5 bytes
+ *
+ * Channel width info in HE Operation Parameter (offset 0-2):
+ * - This is complex and band-dependent (2.4/5/6 GHz)
+ * - For 5 GHz: Similar to VHT operation
+ */
+static void
+parse_he_operation(const uint8_t *ie, gsize len,
+                   gsupplicant_wifi_capability_t *cap)
 {
+    const he_oper_t *he_oper;
+
+    if (len < 5) {
+        GVERBOSE_("HE Operation IE too short: %zu bytes", len);
+        return;
+    }
+
+    he_oper = (const he_oper_t *)ie;
+
+    /* HE Operation Parameter field (byte 0-2) is complex and band-dependent */
+    /* For simplification, use VHT-like width determination if available */
+    /* In real implementation, parse VHT Operation Info within HE Operation */
+
+    /* Default has been set to 80 MHz in HE capabilities parsing */
+    GVERBOSE_("HE Operation: width=%u MHz (from capabilities)", cap->width);
+}
+
+/**
+ * Compute 802.11n/ac/ax PHY rate from parsed capabilities
+ *
+ * Returns rate in bps (not Mbps!)
+ *
+ * IMPORTANT: mcs_index_rates contains rates in Mbps as floats
+ * We multiply by 1,000,000 to convert to bps
+ */
+static guint
+compute_phy_rate(const gsupplicant_wifi_capability_t *cap)
+{
+    float rate_mbps = 0.0f;
+    int gi_idx;
+    int width_idx;
+
+    /* Determine Guard Interval index (0 = long, 1 = short) */
+    gi_idx = cap->short_gi ? 1 : 0;
+
+    /* Determine width index for rate lookup table */
+    switch (cap->width) {
+    case 20:
+        width_idx = 0;
+        break;
+    case 40:
+        width_idx = 1;
+        break;
+    case 80:
+        width_idx = 2;
+        break;
+    case 160:
+        width_idx = 3;
+        break;
+    default:
+        GVERBOSE_("Invalid channel width: %u", cap->width);
+        return 0;
+    }
+
+    /* Lookup rate based on standard type and parameters */
     if (cap->he) {
-        return he_mcs_rates[cap->width][cap->nss - 1][cap->mcs_index];
+        /* HE uses same table as VHT for compatibility */
+        if (cap->mcs_index <= 11 && cap->nss >= 1 && cap->nss <= 8) {
+            rate_mbps = get_80211ac_rate(cap->width, gi_idx,
+                cap->mcs_index > 9 ? 9 : cap->mcs_index,  /* Cap to VHT max */
+                cap->nss);
+        }
+    } else if (cap->vht) {
+        if (cap->mcs_index <= 9 && cap->nss >= 1 && cap->nss <= 8) {
+            rate_mbps = get_80211ac_rate(cap->width, gi_idx,
+                cap->mcs_index, cap->nss);
+        }
+    } else if (cap->ht) {
+        /* HT MCS index is 0-31 (NSS * 8 + MCS) */
+        if (cap->mcs_index <= 31) {
+            rate_mbps = get_80211n_rate(cap->width, gi_idx,
+                cap->mcs_index);
+        }
     }
 
-    if (cap->vht) {
-        return vht_mcs_rates[cap->width][cap->nss - 1][cap->mcs_index];
+    if (rate_mbps <= 0) {
+        GVERBOSE_("Rate lookup failed: HT=%d VHT=%d HE=%d MCS=%u NSS=%u",
+            cap->ht, cap->vht, cap->he, cap->mcs_index, cap->nss);
+        return 0;
     }
 
-    if (cap->ht) {
-        return ht_mcs_rates[cap->width == 40 ? 1 : 0][cap->mcs_index];
-    }
-
-    return 0;
-}*/
-
-static guint compute_phy_rate_aircrack(const GSupplicantWifiCapability *cap)
-{
-    int gi = cap->short_gi ? 1 : 0;
-
-    if (cap->vht) {
-        return (guint)(get_80211ac_rate(
-            cap->width,
-            gi,
-            cap->mcs_index,
-            cap->nss) * 1000000.0f);
-    }
-
-    if (cap->ht) {
-        /* reuse ac function for simplicity OR aircrack ht helper if present */
-        return (guint)(get_80211ac_rate(
-            cap->width,
-            gi,
-            cap->mcs_index,
-            cap->nss) * 1000000.0f);
-    }
-
-    return 0;
+    /* Convert Mbps to bps */
+    return (guint)(rate_mbps * 1000000.0f);
 }
+
+/**
+ * Parse all Information Elements from IEs buffer
+ *
+ * Processes HT/VHT/HE capabilities and operation IEs
+ * to determine maximum rate, MCS, NSS, and channel width
+ *
+ * Returns computed PHY rate in bps
+ */
+guint
+gsupplicant_bss_parse_ies_for_rate(const guint8 *ies, gsize ies_len)
+{
+    gsupplicant_wifi_capability_t cap = {0};
+    gsize i = 0;
+
+    if (!ies || ies_len < 2) {
+        GVERBOSE_("Invalid IEs buffer");
+        return 0;
+    }
+
+    /* Iterate through Information Elements */
+    while (i + 2 <= ies_len) {
+        uint8_t ie_type = ies[i];
+        uint8_t ie_len = ies[i + 1];
+        const uint8_t *ie_data = &ies[i + 2];
+
+        /* Validate IE length */
+        if (i + 2 + ie_len > ies_len) {
+            GVERBOSE_("IE truncated at offset %zu", i);
+            break;
+        }
+
+        GVERBOSE_("IE type=%u len=%u", ie_type, ie_len);
+
+        switch (ie_type) {
+        case 45:  /* HT Capabilities */
+            parse_ht_capabilities(ie_data, ie_len, &cap);
+            break;
+
+        case 61:  /* HT Operation */
+            parse_ht_operation(ie_data, ie_len, &cap);
+            break;
+
+        case 191:  /* VHT Capabilities */
+            parse_vht_capabilities(ie_data, ie_len, &cap);
+            break;
+
+        case 192:  /* VHT Operation */
+            parse_vht_operation(ie_data, ie_len, &cap);
+            break;
+
+        case 255:  /* Extension IE */
+            if (ie_len > 0) {
+                uint8_t ext_type = ie_data[0];
+
+                if (ext_type == 35) {  /* HE Capabilities */
+                    parse_he_capabilities(ie_data, ie_len, &cap);
+                } else if (ext_type == 36) {  /* HE Operation */
+                    parse_he_operation(ie_data, ie_len, &cap);
+                }
+            }
+            break;
+
+        default:
+            break;
+        }
+
+        i += 2 + ie_len;
+    }
+
+    /* Determine Short GI based on final width */
+    if (cap.width > 0) {
+        if (cap.vht || cap.he) {
+            cap.short_gi = vht_parse_short_gi(ies, ies_len, cap.width);
+        } else if (cap.ht) {
+            cap.short_gi = ht_parse_short_gi(ies, ies_len, cap.width);
+        }
+    }
+
+    /* Log final capabilities */
+    GVERBOSE_("Final: HT=%d VHT=%d HE=%d Width=%u MCS=%u NSS=%u SGI=%d",
+        cap.ht, cap.vht, cap.he, cap.width, cap.mcs_index, cap.nss, cap.short_gi);
+
+    /* Compute and return rate */
+    return compute_phy_rate(&cap);
+}
+
 
 static void
 store_rates(GSupplicantBSS* self,
@@ -1059,66 +1517,24 @@ static void update_maxrate(GSupplicantBSS* self, guint maxrate)
     }
 }
 
-static void handle_ies(GSupplicantBSS* self,
-                       const guint8 *ies,
-                       gsize n)
+/**
+ * CORRECTED VERSION: Parse and compute PHY rate from IEs
+ * 
+ * This replaces the flawed handle_ies() and related functions
+ */
+static void
+gsupplicant_bss_update_rates(
+    GSupplicantBSS* self)
 {
-    GSupplicantWifiCapability cap = {0};
+    GSupplicantBSSPriv* priv = self->priv;
+    GVariant* value;
+    guint new_rate = 0;
 
-    for (gsize i = 0; i + 2 <= n;) {
-
-        guint8 id = ies[i];
-        guint8 len = ies[i+1];
-
-        if (i + 2 + len > n)
-            break;
-
-        const guint8 *ie = &ies[i+2];
-
-        switch (id) {
-        case 45:
-            parse_ht_cap(ie, len, &cap);
-            break;
-
-        case 61:
-            parse_ht_oper(ie, len, &cap);
-            break;
-
-        case 191:
-            parse_vht_cap(ie, len, &cap);
-            break;
-
-        case 192:
-            parse_vht_oper(ie, len, &cap);
-            break;
-
-        case 255:
-            if (len > 1) {
-                switch (ie[0]) {
-                case 35:
-                    parse_he_cap(&ie[1], len - 1, &cap);
-                    break;
-                }
-            }
-            break;
-        }
-
-        i += 2 + len;
-    }
-
-    guint new_rate = compute_phy_rate_aircrack(&cap);
-    guint rates[1] = { new_rate };
-
-    store_rates(self, rates, 1);
-    update_maxrate(self, new_rate);
-}
-
-static int update_rates(GSupplicantBSS *self, GVariant *value, gboolean legacy)
-{
+    /* Get IEs from BSS proxy */
+    value = fi_w1_wpa_supplicant1_bss_dup_ies(priv->proxy);
     if (value) {
         gsize n = 0;
-        const guint* values;
-        const guint8* values8;
+        const guint8* ies_data;
 
         if (g_variant_is_of_type(value, G_VARIANT_TYPE_VARIANT)) {
             GVariant* tmp = g_variant_get_variant(value);
@@ -1126,63 +1542,44 @@ static int update_rates(GSupplicantBSS *self, GVariant *value, gboolean legacy)
             value = tmp;
         }
 
-        if (legacy) {
-            values = g_variant_get_fixed_array(value, &n, sizeof(guint));
-            if (values) {
-                handle_legacy(self, values, n);
+        /* Extract IEs as byte array */
+        ies_data = g_variant_get_fixed_array(value, &n, sizeof(guint8));
+        if (ies_data && n > 0) {
+            /* Parse IEs and compute rate */
+            new_rate = gsupplicant_bss_parse_ies_for_rate(ies_data, n);
 
-#if GUTIL_LOG_VERBOSE
-                if (GLOG_ENABLED(GUTIL_LOG_VERBOSE)) {
-                    GString* sb = g_string_new("[");
-                    for (int i=0; i<n; i++) {
-                        if (i > 0) g_string_append_c(sb, ',');
-                        g_string_append_printf(sb, "%u", values[i]);
-                    }
-                    g_string_append_c(sb, ']');
-                    GVERBOSE("[%s] %s: %s", self->path,
-                        PROXY_PROPERTY_NAME_RATES, sb->str);
-                    g_string_free(sb, TRUE);
+            if (new_rate == 0) {
+                GVERBOSE_("[%s] Could not determine rate from IEs, clearing rates",
+                    self->path);
+                gsupplicant_bss_clear_rates(self);
+            } else {
+                /* Store the computed rate */
+                guint rates[1] = { new_rate };
+
+                if (priv->rates.count != 1 ||
+                    memcmp(priv->rates.values, rates, sizeof(guint))) {
+
+                    g_free(priv->rates_values);
+                    priv->rates_values = gutil_memdup(rates, sizeof(guint));
+                    priv->rates.values = priv->rates_values;
+                    priv->rates.count = 1;
+                    self->rates = &priv->rates;
+                    priv->pending_signals |= SIGNAL_BIT(RATES);
+
+                    update_maxrate(self, new_rate);
+
+                    GVERBOSE_("[%s] %s: %u bps (%.1f Mbps)", self->path,
+                        PROXY_PROPERTY_NAME_RATES, new_rate, new_rate / 1000000.0f);
                 }
-#endif
-                return 0;
-            } else {
-                return -EINVAL;
             }
+
+            g_variant_unref(value);
         } else {
-            values8 = g_variant_get_fixed_array(value, &n, sizeof(guint8));
-            if (values8) {
-                handle_ies(self, values8, n);
-                return 0;
-            } else {
-                return -EINVAL;
-            }
+            gsupplicant_bss_clear_rates(self);
         }
-        
     } else {
-        return -EINVAL;
-    }
-}
-
-static
-void
-gsupplicant_bss_update_rates(
-    GSupplicantBSS* self)
-{
-    GSupplicantBSSPriv* priv = self->priv;
-    GVariant* value;
-
-    /*value = fi_w1_wpa_supplicant1_bss_dup_rates(priv->proxy);
-    if (update_rates(self, value, TRUE))
         gsupplicant_bss_clear_rates(self);
-
-    if (value)
-        g_variant_unref(value);*/
-
-    value = fi_w1_wpa_supplicant1_bss_dup_ies(priv->proxy);
-    update_rates(self, value, FALSE);
-
-    if (value)
-        g_variant_unref(value);
+    }
 }
 
 static
