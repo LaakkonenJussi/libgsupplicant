@@ -822,50 +822,713 @@ gsupplicant_bss_clear_rates(
     }
 }
 
-static
-void
-gsupplicant_bss_update_rates(
-    GSupplicantBSS* self)
+static void handle_legacy(GSupplicantBSS* self, const guint *values, gsize n)
 {
     GSupplicantBSSPriv* priv = self->priv;
-    GVariant* value = fi_w1_wpa_supplicant1_bss_dup_rates(priv->proxy);
+
+    if (priv->rates.count != n ||
+        memcmp(priv->rates.values, values, sizeof(guint)*n)) {
+        guint i, maxrate = 0;
+
+        /* Store the rates */
+        g_free(priv->rates_values);
+        priv->rates_values = gutil_memdup(values, sizeof(guint)*n);
+        priv->rates.values = priv->rates_values;
+        priv->rates.count = n;
+        self->rates = &priv->rates;
+        priv->pending_signals |= SIGNAL_BIT(RATES);
+
+        /* Update the maximum rate */
+        for (i=0; i<n; i++) {
+            if (maxrate < values[i]) {
+                maxrate = values[i];
+            }
+        }
+        if (self->maxrate != maxrate) {
+            self->maxrate = maxrate;
+            priv->pending_signals |= SIGNAL_BIT(MAXRATE);
+        }
+    }
+}
+typedef struct {
+    gboolean ht;
+    gboolean vht;
+    gboolean he;
+
+    guint8 nss;
+
+    guint width;   /* 20 / 40 / 80 / 160 */
+    /*guint ht_width;
+    guint vht_width;
+    guint he_width;*/
+
+    /* internal raw flags */
+    guint8 ht_support;
+    guint8 vht_support;
+
+    guint8 he_mcs;
+    guint8 he_gi;
+
+} GSupplicantWifiCapability;
+
+#define HT_CAP_INFO_SUPP_CHANNEL_WIDTH_SET  (1 << 1)
+#define HT_CAP_INFO_SHORT_GI_20MHZ (1 << 5)
+#define HT_CAP_INFO_SHORT_GI_40MHZ (1 << 6)
+
+#define VHT_CAP_MAX_MPDU_LENGTH_MASK 0x3
+#define VHT_CAP_SUPP_CHAN_WIDTH_160MHZ  (1 << 2)
+#define VHT_CAP_SUPP_CHAN_WIDTH_80PLUS80 (1 << 3)
+
+#define WLAN_EID_EXTENSION 255
+#define WLAN_EID_EXT_HE_CAPABILITIES 35
+#define WLAN_EID_EXT_HE_OPERATION    36
+
+static guint8
+ht_get_max_nss(const guint8 *mcs_set)
+{
+    guint8 nss = 0;
+
+    for (int stream = 0; stream < 8; stream++) {
+        guint8 has_rate = 0;
+
+        for (int i = 0; i < 8; i++) {
+            if (mcs_set[stream] & (1 << i)) {
+                has_rate = 1;
+                break;
+            }
+        }
+
+        if (has_rate)
+            nss = stream + 1;
+    }
+
+    return nss;
+}
+
+static gboolean
+ht_supports_40mhz(const guint8 *ht_cap)
+{
+    guint16 cap = ht_cap[0] | (ht_cap[1] << 8);
+    return cap & HT_CAP_INFO_SUPP_CHANNEL_WIDTH_SET;
+}
+
+static void
+parse_ht_oper(const guint8 *ie, gsize len,
+              GSupplicantWifiCapability *cap)
+{
+    if (len < 3)
+        return;
+
+    /*
+     * HT Operation info structure:
+     * byte 0: primary channel
+     * byte 1: HT info subfield (contains channel width)
+     * byte 2: etc...
+     */
+
+    guint8 ht_param = ie[1];
+
+    /* Bit 2 = STA channel width (0 = 20MHz, 1 = 40MHz) */
+    cap->width = (ht_param & 0x4) ? 40 : 20;
+}
+
+/*static void
+parse_ht_cap(const guint8 *ie, gsize len,
+             GSupplicantWifiCapability *cap)
+{
+    if (len < 2)
+        return;
+
+    cap->ht = TRUE;
+
+    // MCS set is bytes 3–10
+    const guint8 *mcs = &ie[3];
+
+    if (mcs[0]) cap->nss = 1;
+    else if (mcs[1]) cap->nss = 2;
+    else if (mcs[2]) cap->nss = 3;
+    else cap->nss = 1;
+}*/
+
+static void
+parse_ht_cap(const guint8 *ie, gsize len,
+             GSupplicantWifiCapability *cap)
+{
+    if (len < 12)
+        return;
+
+    cap->ht = TRUE;
+
+    const guint8 *mcs = &ie[3];
+
+    cap->nss = MAX(cap->nss,
+                   ht_get_max_nss(mcs));
+}
+
+static void
+parse_ht(const guint8 *ie, gsize len,
+         guint8 *nss,
+         guint8 *width,
+         gboolean *short_gi)
+{
+    if (len < 28)
+        return;
+
+    const guint8 *mcs = &ie[12];
+
+    *nss = ht_get_max_nss(mcs);
+    *width = ht_supports_40mhz(ie) ? 40 : 20;
+    *short_gi = ie[0] & HT_CAP_INFO_SHORT_GI_20MHZ;
+}
+
+static void
+parse_he_oper(const guint8 *ie,
+              gsize len,
+              GSupplicantWifiCapability *cap)
+{
+    if (len < 4)
+        return;
+
+    /*
+     * Simplified width derivation.
+     */
+
+    guint8 control = ie[1];
+
+    if (control & 0x08)
+        cap->width = 160;
+    else if (control & 0x04)
+        cap->width = 80;
+    else if (control & 0x02)
+        cap->width = 40;
+    else
+        cap->width = 20;
+}
+
+static void parse_he_cap(const guint8 *ie, gsize len,
+                          GSupplicantWifiCapability *cap)
+{
+    if (len < 12)
+        return;
+
+    cap->he = TRUE;
+
+    /* VERY simplified but stable extraction */
+    const guint8 *mcs = &ie[3];
+
+    guint8 max_mcs = 0;
+
+    for (gsize i = 0; i < len - 3; i++) {
+        if (mcs[i] != 0xff)
+            max_mcs = 11; /* HE max MCS */
+    }
+
+    cap->nss = MAX(cap->nss, 1);
+    cap->he_mcs = max_mcs;
+}
+
+/*static void parse_ht_cap(const guint8 *ie, gsize len,
+                    GSupplicantWifiCapability *cap)
+{
+    cap->ht_supported = TRUE;
+    parse_ht(ie, len, &cap->nss, &cap->width, &cap->short_gi);
+}*/
+
+static guint8
+vht_get_nss(const guint16 *mcs_map)
+{
+    guint8 nss = 0;
+
+    for (int i = 0; i < 8; i++) {
+        guint16 v = (mcs_map[i / 2] >> ((i % 2) * 8)) & 0xFF;
+
+        if (v != VHT_CAP_MAX_MPDU_LENGTH_MASK) // not disabled
+            nss = i + 1;
+    }
+
+    return nss;
+}
+
+static guint8
+vht_get_width(const guint32 cap)
+{
+    if (cap & VHT_CAP_SUPP_CHAN_WIDTH_160MHZ)
+        return 160;
+    if (cap & VHT_CAP_SUPP_CHAN_WIDTH_80PLUS80)
+        return 80; // plus 80+80 (treat as 80 for now)
+    return 80;
+}
+
+static void
+parse_vht_oper(const guint8 *ie, gsize len,
+               GSupplicantWifiCapability *cap)
+{
+    if (len < 3)
+        return;
+
+    /*
+     * VHT Operation:
+     * byte 0: channel width
+     * 0 = 20/40
+     * 1 = 80
+     * 2 = 160 or 80+80
+     */
+
+    guint8 chan_width = ie[0];
+
+    switch (chan_width) {
+    case 0:
+        cap->width = 40;   /* fallback */
+        break;
+    case 1:
+        cap->width = 80;
+        break;
+    case 2:
+        cap->width = 160;
+        break;
+    default:
+        cap->width = 80;
+        break;
+    }
+}
+
+/*static void
+parse_vht_cap(const guint8 *ie, gsize len,
+              GSupplicantWifiCapability *cap)
+{
+    if (len < 4)
+        return;
+
+    cap->vht = TRUE;
+
+    guint32 vht_cap = ie[0] |
+                      (ie[1] << 8) |
+                      (ie[2] << 16) |
+                      (ie[3] << 24);
+
+    // Supported NSS is in MCS map (bytes 4–7 usually)
+    const guint16 *mcs_map = (const guint16 *)&ie[4];
+
+    guint16 map = GUINT16_FROM_LE(mcs_map[0]);
+
+    if (map & 0x0003) cap->nss = MAX(cap->nss, 1);
+    if (map & 0x000C) cap->nss = MAX(cap->nss, 2);
+    if (map & 0x0030) cap->nss = MAX(cap->nss, 3);
+    if (map & 0x00C0) cap->nss = MAX(cap->nss, 4);
+}*/
+
+static void
+parse_vht_cap(const guint8 *ie, gsize len,
+              GSupplicantWifiCapability *cap)
+{
+    if (len < 12)
+        return;
+
+    cap->vht = TRUE;
+
+    const guint16 *mcs_map =
+        (const guint16 *)&ie[4];
+
+    cap->nss = MAX(cap->nss,
+                   vht_get_nss(mcs_map));
+}
+
+static void
+parse_vht(const guint8 *ie, gsize len,
+          guint8 *nss,
+          guint8 *width)
+{
+    if (len < 12)
+        return;
+
+    guint32 cap = ie[0] |
+                  (ie[1] << 8) |
+                  (ie[2] << 16) |
+                  (ie[3] << 24);
+
+    const guint16 *mcs_map = (const guint16 *)&ie[4];
+
+    *nss = vht_get_nss(mcs_map);
+    *width = vht_get_width(cap);
+}
+
+/*static void parse_vht_cap(const guint8 *ie, gsize len, GSupplicantWifiCapability *cap)
+{
+    cap->vht_supported = TRUE;
+    parse_vht(ie, len, &cap->nss, &cap->width);
+}*/
+
+struct rate_entry {
+    guint8 nss;
+    guint8 width;
+    guint16 mbps;
+};
+
+struct rate_entry HT_TABLE[] = {
+    {1, 20, 65},
+    {2, 20, 130},
+    {3, 20, 195},
+    {4, 20, 260},
+    {1, 40, 150},
+    {2, 40, 300},
+    {3, 40, 450},
+    {4, 40, 600},
+    {0},
+};
+
+struct rate_entry VHT_TABLE[] = {
+    {1, 80, 433},
+    {2, 80, 866},
+    {3, 80, 1300},
+    {4, 40, 867},
+    {4, 80, 1733},
+    {1, 160, 867},
+    {2, 160, 1733},
+    {0},
+};
+
+struct rate_entry HE_TABLE[] = {
+    {1, 20, 143},
+    {2, 20, 286},
+    {4, 20, 573},
+    {1, 40, 286},
+    {2, 40, 573},
+    {4, 40, 1147},
+    {1, 80, 600},
+    {2, 80, 1200},
+    {4, 80, 2400},
+    {1, 160, 1200},
+    {2, 160, 2400},
+    {4, 160, 4800},
+    {0},
+};
+
+static guint get_rate(guint8 nss, guint width, struct rate_entry *entry)
+{
+    int i;
+
+    for (i = 0; entry[i].nss != 0; i++) {
+        if (entry[i].nss == nss && entry[i].width == width)
+            return entry[i].mbps * 1000 * 1000;
+    }
+
+    return 0;
+}
+
+/*static void update_maxrate(GSupplicantBSS* self, guint maxrate)
+{
+    GSupplicantBSSPriv* priv = self->priv;
+
+    if (self->maxrate < maxrate) {
+        self->maxrate = maxrate;
+        priv->pending_signals |= SIGNAL_BIT(MAXRATE);
+    }
+}*/
+
+static void
+update_maxrate(GSupplicantBSS* self,
+               guint maxrate)
+{
+    GSupplicantBSSPriv* priv = self->priv;
+
+    self->maxrate = maxrate;
+
+    priv->pending_signals |= SIGNAL_BIT(MAXRATE);
+}
+
+/*static void
+store_rates(GSupplicantBSS* self,
+            const guint *rates,
+            gsize count)
+{
+    GSupplicantBSSPriv* priv = self->priv;
+
+    if (priv->rates.count != count ||
+        memcmp(priv->rates.values, rates,
+               sizeof(guint) * count)) {
+
+        g_free(priv->rates_values);
+
+        priv->rates_values =
+            gutil_memdup(rates, sizeof(guint) * count);
+
+        priv->rates.values = priv->rates_values;
+        priv->rates.count = count;
+
+        self->rates = &priv->rates;
+
+        priv->pending_signals |= SIGNAL_BIT(RATES);
+    }
+}*/
+
+static void
+store_rates(GSupplicantBSS* self,
+            const guint *rates,
+            gsize count)
+{
+    GSupplicantBSSPriv* priv = self->priv;
+
+    g_free(priv->rates_values);
+
+    priv->rates_values =
+        gutil_memdup(rates, sizeof(guint) * count);
+
+    priv->rates.values = priv->rates_values;
+    priv->rates.count = count;
+
+    self->rates = &priv->rates;
+
+    priv->pending_signals |= SIGNAL_BIT(RATES);
+}
+
+static gsize
+dedupe_rates(guint *rates,
+             gsize count)
+{
+    gsize out = 0;
+
+    for (gsize i = 0; i < count; i++) {
+
+        gboolean exists = FALSE;
+
+        for (gsize j = 0; j < out; j++) {
+            if (rates[j] == rates[i]) {
+                exists = TRUE;
+                break;
+            }
+        }
+
+        if (!exists)
+            rates[out++] = rates[i];
+    }
+
+    return out;
+}
+
+static int
+compare_rates(const void *a,
+              const void *b)
+{
+    guint ra = *(const guint *)a;
+    guint rb = *(const guint *)b;
+
+    if (ra < rb)
+        return -1;
+    else if (ra > rb)
+        return 1;
+
+    return 0;
+}
+
+static guint
+he_mcs_factor(guint8 mcs)
+{
+    /* normalized scaling vs MCS 0 baseline */
+    switch (mcs) {
+    case 0: return 100;
+    case 1: return 110;
+    case 2: return 125;
+    case 3: return 140;
+    case 4: return 160;
+    case 5: return 180;
+    case 6: return 200;
+    case 7: return 220;
+    case 8: return 240;
+    case 9: return 260;
+    case 10: return 280;
+    case 11: return 300;
+    default: return 200;
+    }
+}
+
+static void handle_ies(GSupplicantBSS* self, const guint8 *ies, gsize n)
+{
+    GSupplicantWifiCapability cap = {0};
+    struct rate_entry *entry = NULL;
+    guint maxrate = 0;
+    guint new_rate = 0;
+
+    FILE *f = fopen("/tmp/gsupplicant_probe.txt", "a+");
+
+    for (gsize i = 0; i + 2 <= n;) {
+
+        guint8 id = ies[i];
+        guint8 elen = ies[i+1];
+
+        fprintf(f,"IE: id=%u len=%u\n", id, elen);
+
+        if (i + 2 + elen > n)
+            break;
+
+        const guint8 *ie = &ies[i + 2];
+
+        switch (id) {
+        case 45:   /* HT Capabilities */
+            parse_ht_cap(ie, elen, &cap);
+            break;
+
+        case 61:   /* HT Operation */
+            parse_ht_oper(ie, elen, &cap);
+            break;
+
+        case 191:  /* VHT Capabilities */
+            parse_vht_cap(ie, elen, &cap);
+            break;
+
+        case 192:  /* VHT Operation */
+            parse_vht_oper(ie, elen, &cap);
+            break;
+
+        case 255: /* HE */
+            if (elen < 1)
+                break;
+
+            guint8 ext_id = ie[0];
+
+            switch (ext_id) {
+
+            case WLAN_EID_EXT_HE_CAPABILITIES:
+                parse_he_cap(&ie[1], elen - 1, &cap);
+                break;
+            case WLAN_EID_EXT_HE_OPERATION:
+                parse_he_oper(&ie[1], elen - 1, &cap);
+                break;
+            }
+            break;
+
+        default:
+            break;
+        }
+
+        i += elen + 2;
+
+        fprintf(f,"FINAL CAP: ht=%d vht=%d nss=%u width=%u\n",
+                cap.ht, cap.vht, cap.nss, cap.width);
+    }
+
+    if (cap.he)
+        entry = HE_TABLE;
+    else if (cap.vht)
+        entry = VHT_TABLE;
+    else if (cap.ht)
+        entry = HT_TABLE;
+    else
+        entry = NULL;
+
+    if (entry) {
+        guint rates[8];
+        guint rate_count = 0;
+
+        /*
+         * Build synthesized PHY rates list.
+         * Similar to legacy SupportedRates array.
+         */
+
+        if (cap.ht) {
+            guint r20 = get_rate(cap.nss, 20, HT_TABLE);
+            guint r40 = get_rate(cap.nss, 40, HT_TABLE);
+
+            if (r20)
+                rates[rate_count++] = r20;
+
+            if (r40)
+                rates[rate_count++] = r40;
+        }
+
+        if (cap.vht) {
+            guint r80  = get_rate(cap.nss, 80,  VHT_TABLE);
+            guint r160 = get_rate(cap.nss, 160, VHT_TABLE);
+
+            if (r80)
+                rates[rate_count++] = r80;
+
+            if (r160)
+                rates[rate_count++] = r160;
+        }
+
+        if (cap.he) {
+            guint base = get_rate(cap.nss, cap.width, VHT_TABLE);
+
+            if (base == 0)
+                base = get_rate(cap.nss, cap.width, HT_TABLE);
+
+            if (base > 0) {
+
+                guint factor = he_mcs_factor(cap.he_mcs);
+
+                /* scale base VHT-equivalent rate */
+                guint he_rate = (base * factor) / 100;
+
+                rates[rate_count++] = he_rate;
+            }
+        }
+
+        /*
+         * Determine maxrate from synthesized list
+         */
+        for (gsize j = 0; j < rate_count; j++) {
+            if (rates[j] > maxrate)
+                maxrate = rates[j];
+        }
+
+        /* EXACT SAME LOGIC AS handle_legacy() */
+
+        /*GSupplicantBSSPriv* priv = self->priv;
+
+        g_free(priv->rates_values);
+
+        priv->rates_values =
+            gutil_memdup(rates, sizeof(guint) * rate_count);
+
+        priv->rates.values = priv->rates_values;
+        priv->rates.count = rate_count;
+
+        self->rates = &priv->rates;
+
+        priv->pending_signals |= SIGNAL_BIT(RATES);
+
+        // Maxrate
+        self->maxrate = maxrate;
+        priv->pending_signals |= SIGNAL_BIT(MAXRATE);
+        */
+
+        /*
+         * Store rates exactly like legacy path
+         */
+        if (rate_count > 0) {
+            qsort(rates, rate_count, sizeof(guint), compare_rates);
+            rate_count = dedupe_rates(rates, rate_count);
+            store_rates(self, rates, rate_count);
+        }
+
+        update_maxrate(self, maxrate);
+    }
+
+    fclose(f);
+}
+
+static int update_rates(GSupplicantBSS *self, GVariant *value, gboolean legacy)
+{
     if (value) {
         gsize n = 0;
         const guint* values;
+        const guint8* values8;
+
         if (g_variant_is_of_type(value, G_VARIANT_TYPE_VARIANT)) {
             GVariant* tmp = g_variant_get_variant(value);
             g_variant_unref(value);
             value = tmp;
         }
-        values = g_variant_get_fixed_array(value, &n, sizeof(guint));
-        if (values) {
-            if (priv->rates.count != n ||
-                memcmp(priv->rates.values, values, sizeof(guint)*n)) {
-                guint i, maxrate = 0;
 
-                /* Store the rates */
-                g_free(priv->rates_values);
-                priv->rates_values = gutil_memdup(values, sizeof(guint)*n);
-                priv->rates.values = priv->rates_values;
-                priv->rates.count = n;
-                self->rates = &priv->rates;
-                priv->pending_signals |= SIGNAL_BIT(RATES);
-
-                /* Update the maximum rate */
-                for (i=0; i<n; i++) {
-                    if (maxrate < values[i]) {
-                        maxrate = values[i];
-                    }
-                }
-                if (self->maxrate != maxrate) {
-                    self->maxrate = maxrate;
-                    priv->pending_signals |= SIGNAL_BIT(MAXRATE);
-                }
+        if (legacy) {
+            values = g_variant_get_fixed_array(value, &n, sizeof(guint));
+            if (values) {
+                handle_legacy(self, values, n);
 
 #if GUTIL_LOG_VERBOSE
                 if (GLOG_ENABLED(GUTIL_LOG_VERBOSE)) {
                     GString* sb = g_string_new("[");
-                    for (i=0; i<n; i++) {
+                    for (int i=0; i<n; i++) {
                         if (i > 0) g_string_append_c(sb, ',');
                         g_string_append_printf(sb, "%u", values[i]);
                     }
@@ -875,14 +1538,45 @@ gsupplicant_bss_update_rates(
                     g_string_free(sb, TRUE);
                 }
 #endif
+                return 0;
+            } else {
+                return -EINVAL;
             }
         } else {
-            gsupplicant_bss_clear_rates(self);
+            values8 = g_variant_get_fixed_array(value, &n, sizeof(guint8));
+            if (values8) {
+                handle_ies(self, values8, n);
+                return 0;
+            } else {
+                return -EINVAL;
+            }
         }
-        g_variant_unref(value);
+        
     } else {
-        gsupplicant_bss_clear_rates(self);
+        return -EINVAL;
     }
+}
+
+static
+void
+gsupplicant_bss_update_rates(
+    GSupplicantBSS* self)
+{
+    GSupplicantBSSPriv* priv = self->priv;
+    GVariant* value;
+
+    /*value = fi_w1_wpa_supplicant1_bss_dup_rates(priv->proxy);
+    if (update_rates(self, value, TRUE))
+        gsupplicant_bss_clear_rates(self);
+
+    if (value)
+        g_variant_unref(value);*/
+
+    value = fi_w1_wpa_supplicant1_bss_dup_ies(priv->proxy);
+    update_rates(self, value, FALSE);
+
+    if (value)
+        g_variant_unref(value);
 }
 
 static

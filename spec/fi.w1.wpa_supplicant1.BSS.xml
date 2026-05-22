@@ -16,7 +16,9 @@
     <property name="WPA" type="a{sv}" access="read"/>
     <property name="RSN" type="a{sv}" access="read"/>
     <property name="WPS" type="a{sv}" access="read"/>
-    <property name="IEs" type="ay" access="read"/>
+    <property name="IEs" type="ay" access="read">
+      <annotation name="org.gtk.GDBus.C.ForceGVariant" value="true"/>
+    </property>
 <!--
     <property name="Age" type="u" access="read"/>
 -->

@@ -120,6 +120,7 @@ struct gsupplicant_bss {
     GSUPPLICANT_WPS_CAPS wps_caps;
     GSUPPLICANT_BSS_MODE mode;
     GBytes* ies;
+    gsize ies_length;
     gboolean privacy;
     guint frequency;
     const GSupplicantUIntArray* rates;

@@ -952,6 +952,7 @@ gsupplicant_init(
     GSupplicantPriv* priv = G_TYPE_INSTANCE_GET_PRIVATE(self,
         GSUPPLICANT_TYPE, GSupplicantPriv);
     self->priv = priv;
+    gutil_log_default.level = GLOG_LEVEL_VERBOSE;
 }
 
 /**
